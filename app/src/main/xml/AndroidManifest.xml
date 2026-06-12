@@ -13,11 +13,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Required for the service self-restart logic on Android 14/15 -->
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
-
-    <uses-feature android:name="android.hardware.telephony" android:required="false" />
-
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -41,9 +36,7 @@
 
         <receiver
             android:name=".SmsReceiver"
-            android:exported="true"
-            android:directBootAware="true"
-            android:permission="android.permission.BROADCAST_SMS">
+            android:exported="true">
             <intent-filter android:priority="999">
                 <action android:name="android.provider.Telephony.SMS_RECEIVED"/>
             </intent-filter>
@@ -51,13 +44,10 @@
 
         <receiver
             android:name=".BootReceiver"
-            android:exported="true"
-            android:directBootAware="true">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED"/>
-                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
-                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
 
@@ -65,14 +55,13 @@
             android:name=".SmsGatewayService"
             android:enabled="true"
             android:exported="false"
-            android:directBootAware="true"
-            android:stopWithTask="false"
-            android:foregroundServiceType="remoteMessaging|remoteMessaging" />
+            android:foregroundServiceType="remoteMessaging" />
 
+        <!-- Required for WorkManager to run in foreground on Android 14+ -->
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
-            tools:node="merge"
-            android:foregroundServiceType="dataSync|dataSync" />
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
 
     </application>
 

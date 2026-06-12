@@ -11,11 +11,12 @@ class BootReceiver : BroadcastReceiver() {
         context: Context,
         intent: Intent
     ) {
-
-        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
-
-            val serviceIntent =
-                Intent(context, SmsGatewayService::class.java)
+        val action = intent.action
+        if (action == Intent.ACTION_BOOT_COMPLETED || 
+            action == Intent.ACTION_LOCKED_BOOT_COMPLETED ||
+            action == "android.intent.action.QUICKBOOT_POWERON"
+        ) {
+            val serviceIntent = Intent(context, SmsGatewayService::class.java)
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(serviceIntent)
