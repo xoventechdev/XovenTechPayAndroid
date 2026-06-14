@@ -4,14 +4,17 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
-import androidx.work.WorkerParameters
 import androidx.work.ListenableWorker
+import androidx.work.WorkerParameters
+import dev.xoventech.xoventechpay.SmsGatewayService
 
 class SmsForwardWorker(
     private val appContext: Context,
@@ -24,11 +27,14 @@ class SmsForwardWorker(
         val message = inputData.getString("message") ?: return ListenableWorker.Result.failure()
         val transactionId = inputData.getString("transactionId")
 
-        // Mandatory for Android 14/15 to run immediately when app is backgrounded
+        // Promote to foreground so the network call survives the broadcast
+        // wrapping up. Isolated try/catch: if expedited quota is exhausted the
+        // worker is demoted to non-expedited and setForeground() will throw —
+        // we still want the network call to proceed.
         try {
             setForeground(getForegroundInfo())
         } catch (e: Exception) {
-            Log.e("SmsForwardWorker", "Failed to set foreground info: ${e.message}")
+            Log.w(TAG, "Foreground promotion failed (likely demoted): ${e.message}")
         }
 
         return try {
@@ -39,10 +45,16 @@ class SmsForwardWorker(
                 transactionId = transactionId
             )
             ApiClient.apiService.forwardSms(payload)
-            Log.d("SmsForwardWorker", "Successfully forwarded SMS to backend")
+            Log.d(TAG, "Successfully forwarded SMS to backend")
+
+            // If the gateway service was killed while we were processing, bring
+            // it back. We are an expedited foreground worker at this point, so
+            // startForegroundService() is legal.
+            ensureServiceRunning()
+
             ListenableWorker.Result.success()
         } catch (e: Exception) {
-            Log.e("SmsForwardWorker", "Error forwarding SMS: ${e.message}")
+            Log.e(TAG, "Error forwarding SMS: ${e.message}")
             if (runAttemptCount < 3) {
                 ListenableWorker.Result.retry()
             } else {
@@ -51,10 +63,18 @@ class SmsForwardWorker(
         }
     }
 
+    private fun ensureServiceRunning() {
+        if (!SmsGatewayService.isRunning) {
+            ContextCompat.startForegroundService(
+                appContext,
+                Intent(appContext, SmsGatewayService::class.java)
+            )
+        }
+    }
+
     override suspend fun getForegroundInfo(): ForegroundInfo {
-        val channelId = "sms_gateway_channel"
-        val notificationId = 1
-        
+        val channelId = CHANNEL_ID
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val name = "SMS Gateway Service"
             val descriptionText = "Handling background SMS forwarding"
@@ -74,10 +94,19 @@ class SmsForwardWorker(
             .setOngoing(true)
             .build()
 
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ForegroundInfo(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        // The gateway service is declared as foregroundServiceType="remoteMessaging"
+        // in the manifest. This worker's promotion must match — otherwise the
+        // system rejects the startForegroundService call.
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
         } else {
-            ForegroundInfo(notificationId, notification)
+            ForegroundInfo(NOTIFICATION_ID, notification)
         }
+    }
+
+    companion object {
+        private const val TAG = "SmsForwardWorker"
+        private const val CHANNEL_ID = "sms_gateway_channel"
+        private const val NOTIFICATION_ID = 1
     }
 }

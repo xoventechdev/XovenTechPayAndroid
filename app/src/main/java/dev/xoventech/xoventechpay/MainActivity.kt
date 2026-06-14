@@ -34,6 +34,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
+import androidx.work.WorkManager
 import dev.xoventech.xoventechpay.ui.theme.XovenTechPayTheme
 
 class MainActivity : ComponentActivity() {
@@ -57,6 +61,18 @@ class MainActivity : ComponentActivity() {
         } else {
             startService(serviceIntent)
         }
+
+        // Seed the watchdog chain. The worker re-enqueues itself every 15
+        // minutes, so a single one-time starter is enough. KEEP avoids
+        // clobbering an in-flight chain from a prior session.
+        val watchdogStarter = OneTimeWorkRequestBuilder<ServiceWatchdogWorker>()
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            .build()
+        WorkManager.getInstance(this).enqueueUniqueWork(
+            ServiceWatchdogWorker.WORK_NAME,
+            ExistingWorkPolicy.KEEP,
+            watchdogStarter
+        )
 
         setContent {
             XovenTechPayTheme {
