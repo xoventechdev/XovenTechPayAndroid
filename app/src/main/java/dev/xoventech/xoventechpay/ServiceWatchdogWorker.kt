@@ -21,15 +21,13 @@ import java.util.concurrent.TimeUnit
 /**
  * Periodic watchdog that keeps [SmsGatewayService] alive on Android 15+.
  *
- * A [androidx.work.PeriodicWorkRequest] cannot be expedited, but only expedited
- * workers may promote themselves to a foreground service on Android 12+ — and
- * we need the foreground promotion to legally start [SmsGatewayService]. So
- * this worker is a chained [androidx.work.OneTimeWorkRequest]: each invocation
- * re-enqueues itself with a 15-minute initial delay. The unique work name
- * "sms_gateway_watchdog_chain" is shared with [SmsGatewayService.onTaskRemoved],
- * [BootReceiver], and [MainActivity] so that any of those triggers can seed
- * the chain and any in-flight chain is preserved (KEEP) or replaced (REPLACE)
- * depending on context.
+ * This is a chained [androidx.work.OneTimeWorkRequest] — each invocation
+ * re-enqueues itself with a 15-minute initial delay. This avoids the
+ * 15-minute minimum interval limitation of PeriodicWorkRequest while
+ * maintaining regular health checks.
+ *
+ * Uses FOREGROUND_SERVICE_TYPE_DATA_SYNC (6h/24h on Android 15) to match
+ * the gateway service type.
  */
 class ServiceWatchdogWorker(
     context: Context,
@@ -37,46 +35,45 @@ class ServiceWatchdogWorker(
 ) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
-        // Only consume FGS quota when there is actual work to do. When the
-        // service is already running, this is a no-op and consumes no quota.
+        // Only consume FGS quota when the service is actually dead.
         if (!SmsGatewayService.isRunning) {
             try {
-                // Promote self to foreground so we are legally allowed to start
-                // the gateway FGS. We use REMOTE_MESSAGING (12h quota/24h on
-                // Android 15) to match the gateway service and share the same
-                // quota pool as SmsForwardWorker — DATA_SYNC is only 6h/24h
-                // and exhausts quickly under the 15-min re-fire cadence.
                 setForeground(getForegroundInfo())
                 ContextCompat.startForegroundService(
                     applicationContext,
                     Intent(applicationContext, SmsGatewayService::class.java)
                 )
+                Log.d(TAG, "Watchdog restarted gateway service")
             } catch (e: Throwable) {
-                // FGS quota exhausted or other FGSNAE — the service will be
-                // restarted on the next SMS arrival via
-                // SmsForwardWorker.ensureServiceRunning(), or on the next time
-                // the user opens the app via MainActivity. Continue and
-                // re-schedule the chain so we keep polling.
-                Log.w(TAG, "Cannot promote watchdog to FGS to restart service: ${e.message}")
+                // FGS quota exhausted or ForegroundServiceStartNotAllowedException
+                // on Android 15. Not fatal — the AlarmManager heartbeat will
+                // retry, and the SmsReceiver doesn't depend on this service.
+                Log.w(TAG, "Cannot restart service via watchdog: ${e.message}")
             }
+        } else {
+            Log.d(TAG, "Gateway service is running — no action needed")
         }
 
-        // Re-enqueue self for the next cycle. This runs whether or not the
-        // service-restart path above succeeded, so the chain stays alive even
-        // when FGS quota is exhausted.
+        // Re-enqueue self for the next cycle.
+        // IMPORTANT: Do NOT use setExpedited() together with setInitialDelay().
+        // WorkManager forbids this — expedited jobs must run immediately.
+        // The watchdog doesn't need to be expedited for its next cycle;
+        // it only needs to be expedited when FIRST triggered (from
+        // SmsReceiver, BootReceiver, or AlarmHeartbeatReceiver) so it
+        // can call setForeground() and start the FGS.
         return try {
             val next = OneTimeWorkRequestBuilder<ServiceWatchdogWorker>()
                 .setInitialDelay(WATCHDOG_INTERVAL_MINUTES, TimeUnit.MINUTES)
-                .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .build()
             WorkManager.getInstance(applicationContext).enqueueUniqueWork(
                 WORK_NAME,
                 ExistingWorkPolicy.REPLACE,
                 next
             )
+            Log.d(TAG, "Watchdog re-scheduled in ${WATCHDOG_INTERVAL_MINUTES}min")
             Result.success()
         } catch (e: Throwable) {
-            Log.e(TAG, "Failed to re-schedule watchdog chain: ${e.message}")
+            Log.e(TAG, "Failed to re-schedule watchdog: ${e.message}")
             Result.retry()
         }
     }
@@ -103,11 +100,10 @@ class ServiceWatchdogWorker(
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setSilent(true)
             .build()
-        // Use REMOTE_MESSAGING (12h quota/24h on Android 15) instead of
-        // DATA_SYNC (6h quota/24h) so the watchdog has more headroom and
-        // shares the quota pool with the gateway service it manages.
+
+        // Use SPECIAL_USE — no time quota limit on Android 15
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
         } else {
             0
         }
@@ -115,7 +111,6 @@ class ServiceWatchdogWorker(
     }
 
     companion object {
-        /** Unique work name shared across all watchdog entry points. */
         const val WORK_NAME = "sms_gateway_watchdog_chain"
 
         private const val TAG = "ServiceWatchdogWorker"

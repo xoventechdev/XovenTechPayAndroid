@@ -15,6 +15,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
@@ -44,6 +45,9 @@ class MainActivity : ComponentActivity() {
 
     private var hasPermissions by mutableStateOf(false)
     private var isBatteryOptimized by mutableStateOf(true)
+    private var hasOemRestrictions by mutableStateOf(false)
+    private var oemName by mutableStateOf("")
+    private var oemSetupSteps by mutableStateOf(listOf<OemUtils.OemSetupStep>())
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -53,18 +57,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         checkStatus()
 
-        val serviceIntent =
-            Intent(this, SmsGatewayService::class.java)
+        // Detect OEM-specific restrictions
+        hasOemRestrictions = OemUtils.hasOemBatteryRestrictions()
+        oemName = OemUtils.getOemDisplayName()
+        oemSetupSteps = OemUtils.getRequiredSetupSteps(this)
 
+        // Start the foreground service (visual indicator)
+        val serviceIntent = Intent(this, SmsGatewayService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(serviceIntent)
         } else {
             startService(serviceIntent)
         }
 
-        // Seed the watchdog chain. The worker re-enqueues itself every 15
-        // minutes, so a single one-time starter is enough. KEEP avoids
-        // clobbering an in-flight chain from a prior session.
+        // Seed the watchdog chain (WorkManager-based)
         val watchdogStarter = OneTimeWorkRequestBuilder<ServiceWatchdogWorker>()
             .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
             .build()
@@ -74,11 +80,32 @@ class MainActivity : ComponentActivity() {
             watchdogStarter
         )
 
+        // Schedule the AlarmManager heartbeat (backup mechanism)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+            if (!alarmManager.canScheduleExactAlarms()) {
+                try {
+                    startActivity(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM).apply {
+                        data = Uri.parse("package:$packageName")
+                    })
+                } catch (e: Exception) {
+                    // Fall back to setAndAllowWhileIdle
+                }
+            } else {
+                SmsReceiver.scheduleHeartbeat(this)
+            }
+        } else {
+            SmsReceiver.scheduleHeartbeat(this)
+        }
+
         setContent {
             XovenTechPayTheme {
                 MainDashboard(
                     hasPermissions = hasPermissions,
                     isBatteryOptimized = isBatteryOptimized,
+                    hasOemRestrictions = hasOemRestrictions,
+                    oemName = oemName,
+                    oemSetupSteps = oemSetupSteps,
                     onGrantPermissions = {
                         val permissions = mutableListOf(
                             Manifest.permission.RECEIVE_SMS,
@@ -98,14 +125,25 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         checkStatus()
+        // Re-check exact alarm permission on resume
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
+            if (alarmManager.canScheduleExactAlarms()) {
+                SmsReceiver.scheduleHeartbeat(this)
+            }
+        }
     }
 
     private fun checkStatus() {
-        val sms = ContextCompat.checkSelfPermission(this, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
+        val sms = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.RECEIVE_SMS
+        ) == PackageManager.PERMISSION_GRANTED
         val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
         } else true
-        
+
         hasPermissions = sms && notif
         isBatteryOptimized = isBatteryOptimized(this)
     }
@@ -132,6 +170,9 @@ class MainActivity : ComponentActivity() {
 fun MainDashboard(
     hasPermissions: Boolean,
     isBatteryOptimized: Boolean,
+    hasOemRestrictions: Boolean,
+    oemName: String,
+    oemSetupSteps: List<OemUtils.OemSetupStep>,
     onGrantPermissions: () -> Unit,
     onDisableOptimization: () -> Unit
 ) {
@@ -140,12 +181,12 @@ fun MainDashboard(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { 
+                title = {
                     Text(
-                        "Gateway Live", 
+                        "Gateway Live",
                         fontWeight = FontWeight.ExtraBold,
                         style = MaterialTheme.typography.headlineSmall
-                    ) 
+                    )
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.background
@@ -162,14 +203,9 @@ fun MainDashboard(
         ) {
             item { StatusCard(isReady) }
 
+            // ---- System Health Section ----
             item {
-                Text(
-                    "System Health",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
-                )
+                SectionHeader("System Health")
             }
 
             item {
@@ -185,36 +221,201 @@ fun MainDashboard(
             item {
                 RequirementCard(
                     title = "Background Mode",
-                    description = "Always-on gateway persistence",
+                    description = "Disable battery optimization",
                     icon = Icons.Default.BatteryChargingFull,
                     isDone = !isBatteryOptimized,
                     onClick = onDisableOptimization
                 )
             }
 
+            // ---- OEM-Specific Section ----
+            if (hasOemRestrictions && oemSetupSteps.isNotEmpty()) {
+                item {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = Color(0xFFFF9800).copy(alpha = 0.1f)
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(20.dp)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.Warning,
+                                    contentDescription = null,
+                                    tint = Color(0xFFFF9800),
+                                    modifier = Modifier.size(24.dp)
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Text(
+                                    "$oemName Setup Required",
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = Color(0xFFE65100)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            Text(
+                                "Your device has additional battery restrictions " +
+                                    "that can kill background apps. Complete " +
+                                    "ALL steps below for reliable SMS forwarding:",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+
+                            Spacer(modifier = Modifier.height(16.dp))
+
+                            // Render OEM-specific steps
+                            oemSetupSteps.forEachIndexed { index, step ->
+                                if (step.isClickable && step.onClick != null) {
+                                    OemClickableStepCard(step)
+                                } else {
+                                    OemInfoStepCard(step)
+                                }
+                                if (index < oemSetupSteps.lastIndex) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Real-time Monitoring Section ----
             item {
-                Text(
-                    "Real-time Monitoring",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
-                )
+                SectionHeader("Real-time Monitoring")
             }
 
             item { ActivityBox() }
-            
-            item { 
+
+            item {
                 Spacer(modifier = Modifier.height(32.dp))
-                Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Box(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentAlignment = Alignment.Center
+                ) {
                     Text(
-                        "v1.0.8 • Android 15 Optimized",
+                        "v1.0.9 • Android 15 Optimized",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.outline
                     )
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun SectionHeader(title: String) {
+    Text(
+        title,
+        style = MaterialTheme.typography.titleSmall,
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+    )
+}
+
+@Composable
+private fun OemClickableStepCard(step: OemUtils.OemSetupStep) {
+    Surface(
+        onClick = step.onClick ?: {},
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surface,
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFFFF9800)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    step.step,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    fontSize = 14.sp
+                )
+            }
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    step.title,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Text(
+                    step.description,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Icon(
+                Icons.AutoMirrored.Filled.ArrowForward,
+                contentDescription = "Open",
+                modifier = Modifier.size(20.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+        }
+    }
+}
+
+@Composable
+private fun OemInfoStepCard(step: OemUtils.OemSetupStep) {
+    Row(
+        modifier = Modifier.padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(28.dp)
+                .clip(CircleShape)
+                .background(Color(0xFFFF9800)),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                step.step,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                fontSize = 14.sp
+            )
+        }
+
+        Spacer(modifier = Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                step.title,
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Text(
+                step.description,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        Icon(
+            Icons.Default.Info,
+            contentDescription = null,
+            modifier = Modifier.size(20.dp),
+            tint = MaterialTheme.colorScheme.outline
+        )
     }
 }
 
@@ -234,7 +435,8 @@ fun StatusCard(isReady: Boolean) {
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(28.dp),
         colors = CardDefaults.cardColors(
-            containerColor = if (isReady) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.errorContainer
+            containerColor = if (isReady) MaterialTheme.colorScheme.primaryContainer
+            else MaterialTheme.colorScheme.errorContainer
         )
     ) {
         Column(modifier = Modifier.padding(24.dp)) {
@@ -247,9 +449,10 @@ fun StatusCard(isReady: Boolean) {
                     text = if (isReady) "ACTIVE" else "OFFLINE",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Black,
-                    color = if (isReady) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer
+                    color = if (isReady) MaterialTheme.colorScheme.onPrimaryContainer
+                    else MaterialTheme.colorScheme.onErrorContainer
                 )
-                
+
                 if (isReady) {
                     Box(
                         modifier = Modifier
@@ -259,29 +462,43 @@ fun StatusCard(isReady: Boolean) {
                     )
                 }
             }
-            
+
             Spacer(modifier = Modifier.height(12.dp))
-            
+
             Text(
-                text = if (isReady) "Gateway is Operational" else "System Halted",
+                text = if (isReady) "Gateway is Operational"
+                else "System Halted",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
-                color = if (isReady) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onErrorContainer
+                color = if (isReady) MaterialTheme.colorScheme.onPrimaryContainer
+                else MaterialTheme.colorScheme.onErrorContainer
             )
-            
+
             Spacer(modifier = Modifier.height(8.dp))
-            
+
             Text(
-                text = if (isReady) "Listening for transactions. Service will continue running when the app is closed." else "Important: Tap the cards below to grant permissions and disable battery limits.",
+                text = if (isReady)
+                    "Listening for transactions. SMS forwarding works even when " +
+                        "the app is closed or the phone restarts."
+                else
+                    "Important: Complete ALL setup steps below — including the " +
+                        "device-specific steps if shown.",
                 style = MaterialTheme.typography.bodyMedium,
-                color = if (isReady) MaterialTheme.colorScheme.onPrimaryContainer.copy(0.7f) else MaterialTheme.colorScheme.onErrorContainer.copy(0.7f)
+                color = if (isReady) MaterialTheme.colorScheme.onPrimaryContainer.copy(0.7f)
+                else MaterialTheme.colorScheme.onErrorContainer.copy(0.7f)
             )
         }
     }
 }
 
 @Composable
-fun RequirementCard(title: String, description: String, icon: ImageVector, isDone: Boolean, onClick: () -> Unit) {
+fun RequirementCard(
+    title: String,
+    description: String,
+    icon: ImageVector,
+    isDone: Boolean,
+    onClick: () -> Unit
+) {
     Surface(
         onClick = if (!isDone) onClick else ({}),
         shape = RoundedCornerShape(20.dp),
@@ -296,27 +513,48 @@ fun RequirementCard(title: String, description: String, icon: ImageVector, isDon
                 modifier = Modifier
                     .size(44.dp)
                     .clip(RoundedCornerShape(12.dp))
-                    .background(if (isDone) MaterialTheme.colorScheme.primary.copy(0.1f) else MaterialTheme.colorScheme.surface),
+                    .background(
+                        if (isDone) MaterialTheme.colorScheme.primary.copy(0.1f)
+                        else MaterialTheme.colorScheme.surface
+                    ),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    icon, 
-                    contentDescription = null, 
-                    tint = if (isDone) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                    icon,
+                    contentDescription = null,
+                    tint = if (isDone) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.outline
                 )
             }
-            
+
             Spacer(modifier = Modifier.width(16.dp))
-            
+
             Column(modifier = Modifier.weight(1f)) {
-                Text(title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodyLarge)
-                Text(description, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    title,
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.bodyLarge
+                )
+                Text(
+                    description,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
 
             if (isDone) {
-                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color(0xFF4CAF50))
+                Icon(
+                    Icons.Default.CheckCircle,
+                    contentDescription = null,
+                    tint = Color(0xFF4CAF50)
+                )
             } else {
-                Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null, modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowForward,
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
             }
         }
     }

@@ -10,7 +10,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <uses-feature android:name="android.hardware.telephony" android:required="false" />
 
@@ -54,21 +58,38 @@
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.miui.home.action.LAUNCH" />
             </intent-filter>
         </receiver>
 
+        <receiver
+            android:name=".AlarmHeartbeatReceiver"
+            android:exported="false"
+            android:directBootAware="true" />
+
+        <!-- Gateway Service: Uses SPECIAL_USE type which has NO time quota
+             limit on Android 15. We provide a description property to
+             explain why we need this type. If startForeground fails (quota
+             still exhausted from other types), the service gracefully
+             falls back to a regular service. -->
         <service
             android:name=".SmsGatewayService"
             android:enabled="true"
             android:exported="false"
             android:directBootAware="true"
             android:stopWithTask="false"
-            android:foregroundServiceType="remoteMessaging" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="SMS gateway monitoring service: maintains a persistent notification to indicate the SMS forwarding gateway is active. No data syncing or messaging — purely a visual health indicator." />
+        </service>
 
+        <!-- SystemForegroundService: declares ALL types that any worker may
+             request. This prevents type mismatch crashes. -->
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             tools:node="merge"
-            android:foregroundServiceType="dataSync|remoteMessaging" />
+            android:foregroundServiceType="dataSync|remoteMessaging|specialUse" />
 
     </application>
 

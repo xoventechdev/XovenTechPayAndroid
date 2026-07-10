@@ -15,7 +15,18 @@ import androidx.work.ForegroundInfo
 import androidx.work.ListenableWorker
 import androidx.work.WorkerParameters
 import dev.xoventech.xoventechpay.SmsGatewayService
+import dev.xoventech.xoventechpay.SmsReceiver
 
+/**
+ * Worker that forwards a received SMS to the backend webhook.
+ *
+ * This worker is the ONLY component that makes network calls. It's triggered
+ * by [dev.xoventech.xoventechpay.SmsReceiver] and uses expedited execution
+ * for immediate processing on Android 15.
+ *
+ * FGS type changed to DATA_SYNC to match the manifest declaration and avoid
+ * type mismatch crashes.
+ */
 class SmsForwardWorker(
     private val appContext: Context,
     workerParams: WorkerParameters
@@ -27,14 +38,15 @@ class SmsForwardWorker(
         val message = inputData.getString("message") ?: return ListenableWorker.Result.failure()
         val transactionId = inputData.getString("transactionId")
 
-        // Promote to foreground so the network call survives the broadcast
-        // wrapping up. Isolated try/catch: if expedited quota is exhausted the
-        // worker is demoted to non-expedited and setForeground() will throw —
-        // we still want the network call to proceed.
+        Log.d(TAG, "Forwarding SMS from $sender to webhook")
+
+        // Promote to foreground so the network call survives app backgrounding.
+        // Isolated try/catch: if expedited quota is exhausted, the worker
+        // continues as a regular (non-foreground) worker.
         try {
             setForeground(getForegroundInfo())
         } catch (e: Exception) {
-            Log.w(TAG, "Foreground promotion failed (likely demoted): ${e.message}")
+            Log.w(TAG, "Foreground promotion failed (quota exhausted?): ${e.message}")
         }
 
         return try {
@@ -44,17 +56,23 @@ class SmsForwardWorker(
                 message = message,
                 transactionId = transactionId
             )
-            ApiClient.apiService.forwardSms(payload)
-            Log.d(TAG, "Successfully forwarded SMS to backend")
+            val response = ApiClient.apiService.forwardSms(payload)
+            Log.d(TAG, "SMS forwarded successfully: ${response.success}")
 
-            // If the gateway service was killed while we were processing, bring
-            // it back. We are an expedited foreground worker at this point, so
-            // startForegroundService() is legal.
+            // Reschedule the heartbeat alarm — keeps the chain alive
+            SmsReceiver.scheduleHeartbeat(appContext)
+
+            // Optionally restart the gateway service (visual indicator only)
             ensureServiceRunning()
 
             ListenableWorker.Result.success()
         } catch (e: Exception) {
             Log.e(TAG, "Error forwarding SMS: ${e.message}")
+            // Still reschedule heartbeat on failure — keeps the system alive
+            try {
+                SmsReceiver.scheduleHeartbeat(appContext)
+            } catch (_: Exception) {}
+
             if (runAttemptCount < 3) {
                 ListenableWorker.Result.retry()
             } else {
@@ -65,10 +83,14 @@ class SmsForwardWorker(
 
     private fun ensureServiceRunning() {
         if (!SmsGatewayService.isRunning) {
-            ContextCompat.startForegroundService(
-                appContext,
-                Intent(appContext, SmsGatewayService::class.java)
-            )
+            try {
+                ContextCompat.startForegroundService(
+                    appContext,
+                    Intent(appContext, SmsGatewayService::class.java)
+                )
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot restart service from forward worker: ${e.message}")
+            }
         }
     }
 
@@ -94,11 +116,13 @@ class SmsForwardWorker(
             .setOngoing(true)
             .build()
 
-        // The gateway service is declared as foregroundServiceType="remoteMessaging"
-        // in the manifest. This worker's promotion must match — otherwise the
-        // system rejects the startForegroundService call.
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
+        // Use REMOTE_MESSAGING (12h/24h quota) — double the budget of DATA_SYNC (6h)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ForegroundInfo(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
+            )
         } else {
             ForegroundInfo(NOTIFICATION_ID, notification)
         }
